@@ -7,9 +7,16 @@ use rand::RngCore;
 use std::fs::{self, File};
 use std::io::{self, Read, Write, BufReader, BufWriter};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 use tar::Builder;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+
+#[cfg(unix)]
+use libc::{mlock, munlock};
+
+#[cfg(windows)]
+use windows_sys::Win32::System::Memory::{VirtualLock, VirtualUnlock};
 
 const CHUNK_SIZE: usize = 64 * 1024 * 1024;
 const SALT_LEN: usize = 16;
@@ -17,6 +24,54 @@ const NONCE_LEN: usize = 12;
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct SensitiveData(Vec<u8>);
+
+fn pin_memory(data: &mut [u8]) -> Result<(), String> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let ptr = data.as_mut_ptr() as *mut std::ffi::c_void;
+    let len = data.len();
+    #[cfg(unix)]
+    {
+        if unsafe { mlock(ptr, len) } != 0 {
+            return Err("Failed to mlock".to_string());
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        if unsafe { VirtualLock(ptr, len) } == 0 {
+            return Err("Failed to VirtualLock".to_string());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err("Unsupported platform".to_string())
+}
+
+fn unpin_memory(data: &mut [u8]) -> Result<(), String> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let ptr = data.as_mut_ptr() as *mut std::ffi::c_void;
+    let len = data.len();
+    #[cfg(unix)]
+    {
+        if unsafe { munlock(ptr, len) } != 0 {
+            return Err("Failed to munlock".to_string());
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        if unsafe { VirtualUnlock(ptr, len) } == 0 {
+            return Err("Failed to VirtualUnlock".to_string());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err("Unsupported platform".to_string())
+}
 
 pub struct EncryptionOptions {
     pub custom_salt: Option<String>,
@@ -37,7 +92,6 @@ pub fn derive_key(secret_input: &[u8], salt: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     argon.hash_password_into(secret_input, salt, &mut out)
         .expect("Argon2id hashing failed");
-
     out
 }
 
@@ -72,6 +126,8 @@ pub fn encrypt_folder(folder_path: &str, password: &str, options: EncryptionOpti
     }
     
     let mut key_bytes = SensitiveData(derive_key(password.as_bytes(), &salt).to_vec());
+    pin_memory(&mut key_bytes.0).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    pin_memory(&mut key_bytes.0).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let key = Key::from_slice(&key_bytes.0);
     let cipher = ChaCha20Poly1305::new(key);
 
@@ -101,7 +157,9 @@ pub fn encrypt_folder(folder_path: &str, password: &str, options: EncryptionOpti
         writer.write_all(&ciphertext)?;
     }
 
-    key_bytes.zeroize();
+    let _ = unpin_memory(&mut key_bytes.0);
+let _ = unpin_memory(&mut key_bytes.0);
+key_bytes.zeroize();
     buffer.zeroize();
 
     fs::remove_file(&tar_filename)?;

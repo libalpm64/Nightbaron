@@ -6,6 +6,174 @@ use std::thread;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
+use memsec;
+
+#[derive(Clone)]
+struct SecureString {
+    data: Vec<u8>,
+    obfuscation_key: [u8; 16],
+}
+
+impl SecureString {
+    fn new() -> Self {
+        let data = Vec::new();
+        let mut obfuscation_key = [0u8; 16];
+        
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        rng.fill(&mut obfuscation_key);
+        
+        Self { data, obfuscation_key }
+    }
+    
+    fn allocate_secure(capacity: usize) -> Vec<u8> {
+        #[cfg(windows)]
+        {
+            unsafe {
+                use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};                
+                const PAGE_SIZE: usize = 4096;
+                let total_size = capacity + (2 * PAGE_SIZE);
+                
+                let ptr = VirtualAlloc(
+                    std::ptr::null_mut(),
+                    total_size,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE
+                );
+                
+                if ptr.is_null() {
+                    Vec::with_capacity(capacity)
+                } else {
+                    let data_start = ptr.add(PAGE_SIZE) as *mut u8;
+                    Vec::from_raw_parts(data_start, 0, capacity)
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Vec::with_capacity(capacity)
+        }
+    }
+    
+    fn obfuscate_data(&mut self) {
+        for (i, byte) in self.data.iter_mut().enumerate() {
+            *byte ^= self.obfuscation_key[i % self.obfuscation_key.len()];
+        }
+    }
+    
+    fn deobfuscate_data(&mut self) {
+        self.obfuscate_data();
+    }
+    
+    
+    fn as_str(&self) -> String {
+        let mut temp_data = self.data.clone();
+        for (i, byte) in temp_data.iter_mut().enumerate() {
+            *byte ^= self.obfuscation_key[i % self.obfuscation_key.len()];
+        }
+        String::from_utf8(temp_data).unwrap_or_else(|_| String::new())
+    }
+    
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+    
+    fn clear(&mut self) {
+        self.data.zeroize();
+        self.data.clear();
+    }
+    
+    fn zeroize(&mut self) {
+        self.data.zeroize();
+    }
+    
+    fn update_from_buffer(&mut self, buffer: &mut String) {
+        if !self.data.is_empty() {
+            unsafe { memsec::munlock(self.data.as_mut_ptr(), self.data.len()) };
+        }
+        
+        self.data.zeroize();
+        
+        if buffer.len() > 64 {
+            self.data = Self::allocate_secure(buffer.len());
+            self.data.extend_from_slice(buffer.as_bytes());
+        } else {
+            self.data.clear();
+            self.data.extend_from_slice(buffer.as_bytes());
+        }
+        self.obfuscate_data();
+        
+        if !self.data.is_empty() {
+            unsafe { memsec::mlock(self.data.as_mut_ptr(), self.data.len()) };
+        }
+        
+        buffer.zeroize();
+        buffer.clear();
+    }
+    
+    fn constant_time_eq(&self, other: &SecureString) -> bool {
+        if self.data.len() != other.data.len() {
+            return false;
+        }
+        
+        let mut temp_self = self.data.clone();
+        let mut temp_other = other.data.clone();
+        
+        for (i, byte) in temp_self.iter_mut().enumerate() {
+            *byte ^= self.obfuscation_key[i % self.obfuscation_key.len()];
+        }
+        for (i, byte) in temp_other.iter_mut().enumerate() {
+            *byte ^= other.obfuscation_key[i % other.obfuscation_key.len()];
+        }
+        
+        let mut result = 0u8;
+        for (a, b) in temp_self.iter().zip(temp_other.iter()) {
+            result |= a ^ b;
+        }
+        
+        temp_self.zeroize();
+        temp_other.zeroize();
+        
+        result == 0
+    }
+}
+
+impl Drop for SecureString {
+    fn drop(&mut self) {
+        if !self.data.is_empty() {
+            unsafe { memsec::munlock(self.data.as_mut_ptr(), self.data.len()) };
+        }
+        self.data.zeroize();
+    }
+}
+
+
+#[cfg(target_os = "linux")]
+use dbus::blocking::Connection;
+#[cfg(target_os = "linux")]
+use std::thread;
+
+#[cfg(windows)]
+use windows_sys::Win32::System::Power::PowerRegisterSuspendResumeNotification;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::sync::mpsc::Sender as MpscSender;
+#[cfg(windows)]
+use std::sync::Mutex;
+
+#[cfg(windows)]
+static WINDOWS_SUSPEND_SENDER: Mutex<Option<MpscSender<AppMessage>>> = Mutex::new(None);
+
+#[cfg(unix)]
+use libc::prctl;
+#[cfg(unix)]
+const PR_SET_DUMPABLE: i32 = 4;
+
+#[cfg(windows)]
+use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS};
 
 mod crypto;
 
@@ -17,6 +185,7 @@ enum AppMessage {
     DecryptComplete(String),
     DecryptError(String),
     Log(String),
+    SuspendDetected,
 }
 
 #[derive(PartialEq)]
@@ -30,34 +199,49 @@ enum Tab {
 struct NightbaronApp {
     current_tab: Tab,
     encrypt_path: String,
-    encrypt_pass: String,
+    encrypt_pass: SecureString,
     decrypt_path: String,
-    decrypt_pass: String,
+    decrypt_pass: SecureString,
     status_message: String,
     is_processing: bool,
     logs: Vec<String>,
-    custom_salt: String,
+    custom_salt: SecureString,
     delete_original: bool,
     sender: Sender<AppMessage>,
     receiver: Receiver<AppMessage>,
+    encrypt_pass_buffer: String,
+    decrypt_pass_buffer: String,
+    custom_salt_buffer: String,
 }
 
 impl NightbaronApp {
+    fn zeroize_sensitive_data(&mut self) {
+        self.encrypt_pass.zeroize();
+        self.encrypt_pass.clear();
+        self.decrypt_pass.zeroize();
+        self.decrypt_pass.clear();
+        self.custom_salt.zeroize();
+        self.custom_salt.clear();
+        self.add_log("Sensitive data zeroized due to suspend/sleep event".to_owned());
+    }
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (sender, receiver) = channel();
         Self {
             current_tab: Tab::Encrypt,
             encrypt_path: String::new(),
-            encrypt_pass: String::new(),
+            encrypt_pass: SecureString::new(),
             decrypt_path: String::new(),
-            decrypt_pass: String::new(),
+            decrypt_pass: SecureString::new(),
             status_message: "Ready".to_owned(),
             is_processing: false,
             logs: vec![Self::format_log("started")],
-            custom_salt: String::new(),
+            custom_salt: SecureString::new(),
             delete_original: false,
             sender,
             receiver,
+            encrypt_pass_buffer: String::new(),
+            decrypt_pass_buffer: String::new(),
+            custom_salt_buffer: String::new(),
         }
     }
 
@@ -120,6 +304,9 @@ impl NightbaronApp {
                 AppMessage::Log(msg) => {
                     self.add_log(msg);
                 }
+                AppMessage::SuspendDetected => {
+                    self.zeroize_sensitive_data();
+                }
             }
         }
     }
@@ -162,24 +349,30 @@ impl eframe::App for NightbaronApp {
 
                     ui.add_space(10.0);
                     ui.label("Password:");
-                    ui.add(egui::TextEdit::singleline(&mut self.encrypt_pass).password(true));
+                    ui.add(egui::TextEdit::singleline(&mut self.encrypt_pass_buffer).password(true));
 
                     ui.add_space(20.0);
                     
                     let btn = egui::Button::new("ENCRYPT");
                     
                     if ui.add_enabled(!self.is_processing, btn).clicked() {
+                        if !self.encrypt_pass_buffer.is_empty() {
+                            self.encrypt_pass.update_from_buffer(&mut self.encrypt_pass_buffer);
+                        }
+                        if !self.custom_salt_buffer.is_empty() {
+                            self.custom_salt.update_from_buffer(&mut self.custom_salt_buffer);
+                        }
                         if self.encrypt_path.is_empty() || self.encrypt_pass.is_empty() {
                             self.status_message = "Please fill in all fields".to_owned();
                         } else if !Path::new(&self.encrypt_path).exists() {
                             self.status_message = "Selected path does not exist".to_owned();
                         } else {
                             let path = self.encrypt_path.clone();
-                            let mut pass = self.encrypt_pass.clone();
+                            let mut pass_buffer = self.encrypt_pass.as_str();
                             let sender = self.sender.clone();
                             
                             let options = crypto::EncryptionOptions {
-                                custom_salt: if self.custom_salt.is_empty() { None } else { Some(self.custom_salt.clone()) },
+                                custom_salt: if self.custom_salt.is_empty() { None } else { Some(self.custom_salt.as_str().to_string()) },
                                 delete_original: self.delete_original,
                             };
                             
@@ -188,7 +381,7 @@ impl eframe::App for NightbaronApp {
                             
                             thread::spawn(move || {
                                 sender.send(AppMessage::EncryptStart).ok();
-                                match crypto::encrypt_folder(&path, &pass, options) {
+                                match crypto::encrypt_folder(&path, &pass_buffer, options) {
                                     Ok(filename) => {
                                         sender.send(AppMessage::EncryptComplete(filename)).ok();
                                     },
@@ -196,8 +389,10 @@ impl eframe::App for NightbaronApp {
                                         sender.send(AppMessage::EncryptError(e.to_string())).ok();
                                     }
                                 }
-                                pass.zeroize();
+                                pass_buffer.zeroize();
                             });
+                            self.encrypt_pass.zeroize();
+                            self.encrypt_pass.clear();
                         }
                     }
                 }
@@ -214,20 +409,23 @@ impl eframe::App for NightbaronApp {
 
                     ui.add_space(10.0);
                     ui.label("Password:");
-                    ui.add(egui::TextEdit::singleline(&mut self.decrypt_pass).password(true));
+                    ui.add(egui::TextEdit::singleline(&mut self.decrypt_pass_buffer).password(true));
 
                     ui.add_space(20.0);
 
                     let btn = egui::Button::new("DECRYPT");
                     
                     if ui.add_enabled(!self.is_processing, btn).clicked() {
+                        if !self.decrypt_pass_buffer.is_empty() {
+                            self.decrypt_pass.update_from_buffer(&mut self.decrypt_pass_buffer);
+                        }
                         if self.decrypt_path.is_empty() || self.decrypt_pass.is_empty() {
                             self.status_message = "Please fill in all fields".to_owned();
                         } else if !self.decrypt_path.ends_with(".nightbaron") {
                             self.status_message = "Please select a .nightbaron file".to_owned();
                         } else {
                             let path = self.decrypt_path.clone();
-                            let mut pass = self.decrypt_pass.clone();
+                            let mut pass_buffer = self.decrypt_pass.as_str();
                             let sender = self.sender.clone();
 
                             self.status_message = "Starting decryption...".to_owned();
@@ -235,7 +433,7 @@ impl eframe::App for NightbaronApp {
 
                             thread::spawn(move || {
                                 sender.send(AppMessage::DecryptStart).ok();
-                                match crypto::decrypt_file(&path, &pass) {
+                                match crypto::decrypt_file(&path, &pass_buffer) {
                                     Ok(msg) => {
                                         sender.send(AppMessage::DecryptComplete(msg)).ok();
                                     },
@@ -243,8 +441,10 @@ impl eframe::App for NightbaronApp {
                                         sender.send(AppMessage::DecryptError(e.to_string())).ok();
                                     }
                                 }
-                                pass.zeroize();
+                                pass_buffer.zeroize();
                             });
+                            self.decrypt_pass.zeroize();
+                            self.decrypt_pass.clear();
                         }
                     }
                 }
@@ -253,7 +453,7 @@ impl eframe::App for NightbaronApp {
                     ui.add_space(10.0);
                     
                     ui.label("Custom Salt (Optional):");
-                    ui.text_edit_singleline(&mut self.custom_salt);
+                    ui.add(egui::TextEdit::singleline(&mut self.custom_salt_buffer));
                     ui.label(egui::RichText::new("Leave empty to use a random salt (Recommended)").small().weak());
                     
                     ui.add_space(10.0);
@@ -281,7 +481,62 @@ impl eframe::App for NightbaronApp {
     }
 }
 
+fn disable_core_dumps() {
+    #[cfg(unix)]
+    unsafe {
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
+    #[cfg(windows)]
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn setup_linux_suspend_hook(sender: Sender<AppMessage>) {
+    thread::spawn(move || {
+        let conn = Connection::new_system().expect("Failed to connect to system bus");
+        conn.add_match("type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'").expect("Failed to add match");
+        for msg in conn.incoming(1000) {
+            if let Some(prepare) = msg.get1::<bool>() {
+                if prepare {
+                    sender.send(AppMessage::SuspendDetected).ok();
+                    println!("Linux suspend detected zeroizing sensitive data");
+                }
+            }
+        }
+    });
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn suspend_resume_callback(_context: *mut c_void, suspend_type: u32, _: *mut c_void) -> u32 {
+    if suspend_type == 4 {
+        if let Ok(sender_guard) = WINDOWS_SUSPEND_SENDER.lock() {
+            if let Some(ref sender) = *sender_guard {
+                sender.send(AppMessage::SuspendDetected).ok();
+                println!("Windows suspend detected zeroizing sensitive data");
+            }
+        }
+    }
+    0
+}
+
+#[cfg(windows)]
+fn setup_windows_suspend_hook(app: &mut NightbaronApp) {
+    if let Ok(mut sender_guard) = WINDOWS_SUSPEND_SENDER.lock() {
+        *sender_guard = Some(app.sender.clone());
+    }
+    
+    unsafe {
+        let mut handle: HANDLE = std::mem::zeroed();
+        let callback = suspend_resume_callback as isize;
+        PowerRegisterSuspendResumeNotification(0, callback, &mut handle as *mut _ as *mut *mut c_void);
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    disable_core_dumps();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([580.0, 450.0])
@@ -292,6 +547,16 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Nightbaron Encryption",
         options,
-        Box::new(|cc| Ok(Box::new(NightbaronApp::new(cc)))),
+        Box::new(|cc| {
+            let mut app = NightbaronApp::new(cc);
+
+            #[cfg(target_os = "linux")]
+            setup_linux_suspend_hook(app.sender.clone());
+
+            #[cfg(windows)]
+            setup_windows_suspend_hook(&mut app);
+
+            Ok(Box::new(app))
+        }),
     )
 }
