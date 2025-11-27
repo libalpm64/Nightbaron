@@ -7,6 +7,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 use memsec;
+use rand::RngCore;
 
 #[derive(Clone)]
 struct SecureString {
@@ -67,11 +68,13 @@ impl SecureString {
     
     
     fn as_str(&self) -> String {
-        let mut temp_data = self.data.clone();
-        for (i, byte) in temp_data.iter_mut().enumerate() {
-            *byte ^= self.obfuscation_key[i % self.obfuscation_key.len()];
-        }
-        String::from_utf8(temp_data).unwrap_or_else(|_| String::new())
+        vmp_ultra!("as_str", {
+            let mut temp_data = self.data.clone();
+            for (i, byte) in temp_data.iter_mut().enumerate() {
+                *byte ^= self.obfuscation_key[i % self.obfuscation_key.len()];
+            }
+            String::from_utf8(temp_data).unwrap_or_else(|_| String::new())
+        })
     }
     
     fn is_empty(&self) -> bool {
@@ -88,27 +91,29 @@ impl SecureString {
     }
     
     fn update_from_buffer(&mut self, buffer: &mut String) {
-        if !self.data.is_empty() {
-            unsafe { memsec::munlock(self.data.as_mut_ptr(), self.data.len()) };
-        }
-        
-        self.data.zeroize();
-        
-        if buffer.len() > 64 {
-            self.data = Self::allocate_secure(buffer.len());
-            self.data.extend_from_slice(buffer.as_bytes());
-        } else {
-            self.data.clear();
-            self.data.extend_from_slice(buffer.as_bytes());
-        }
-        self.obfuscate_data();
-        
-        if !self.data.is_empty() {
-            unsafe { memsec::mlock(self.data.as_mut_ptr(), self.data.len()) };
-        }
-        
-        buffer.zeroize();
-        buffer.clear();
+        vmp_ultra!("update_from_buffer", {
+            if !self.data.is_empty() {
+                unsafe { memsec::munlock(self.data.as_mut_ptr(), self.data.len()) };
+            }
+
+            self.data.zeroize();
+
+            if buffer.len() > 64 {
+                self.data = Self::allocate_secure(buffer.len());
+                self.data.extend_from_slice(buffer.as_bytes());
+            } else {
+                self.data.clear();
+                self.data.extend_from_slice(buffer.as_bytes());
+            }
+            self.obfuscate_data();
+
+            if !self.data.is_empty() {
+                unsafe { memsec::mlock(self.data.as_mut_ptr(), self.data.len()) };
+            }
+
+            buffer.zeroize();
+            buffer.clear();
+        })
     }
     
     fn constant_time_eq(&self, other: &SecureString) -> bool {
@@ -147,6 +152,83 @@ impl Drop for SecureString {
     }
 }
 
+#[derive(Clone)]
+struct SecureInputBuffer {
+    encrypted_data: Vec<u8>,
+    encryption_key: [u8; 32],
+    length: usize,
+}
+
+impl SecureInputBuffer {
+    fn new() -> Self {
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        Self {
+            encrypted_data: Vec::new(),
+            encryption_key: key,
+            length: 0,
+        }
+    }
+
+    fn push(&mut self, ch: char) {
+        vmp_ultra!("secure_input_push", {
+            let byte = ch as u8;
+            let encrypted_byte = byte ^ self.encryption_key[self.length % 32];
+            self.encrypted_data.push(encrypted_byte);
+            self.length += 1;
+        })
+    }
+
+    fn pop(&mut self) -> Option<char> {
+        vmp_ultra!("secure_input_pop", {
+            if self.length > 0 {
+                self.length -= 1;
+                let encrypted_byte = self.encrypted_data.pop().unwrap();
+                let byte = encrypted_byte ^ self.encryption_key[self.length % 32];
+                Some(byte as char)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn clear(&mut self) {
+        vmp_ultra!("secure_input_clear", {
+            self.encrypted_data.zeroize();
+            self.encrypted_data.clear();
+            self.length = 0;
+        })
+    }
+
+    fn as_string(&self) -> String {
+        vmp_ultra!("secure_input_as_string", {
+            let mut result = String::with_capacity(self.length);
+            for (i, &encrypted_byte) in self.encrypted_data.iter().enumerate() {
+                let byte = encrypted_byte ^ self.encryption_key[i % 32];
+                result.push(byte as char);
+            }
+            result
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.length
+    }
+
+    fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+}
+
+impl Drop for SecureInputBuffer {
+    fn drop(&mut self) {
+        vmp_ultra!("secure_input_drop", {
+            self.encrypted_data.zeroize();
+            self.encryption_key.zeroize();
+        })
+    }
+}
+
 
 #[cfg(target_os = "linux")]
 use dbus::blocking::Connection;
@@ -175,6 +257,8 @@ const PR_SET_DUMPABLE: i32 = 4;
 #[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS};
 
+#[macro_use]
+mod vmp;
 mod crypto;
 
 enum AppMessage {
@@ -209,9 +293,9 @@ struct NightbaronApp {
     delete_original: bool,
     sender: Sender<AppMessage>,
     receiver: Receiver<AppMessage>,
-    encrypt_pass_buffer: String,
-    decrypt_pass_buffer: String,
-    custom_salt_buffer: String,
+    encrypt_pass_buffer: SecureInputBuffer,
+    decrypt_pass_buffer: SecureInputBuffer,
+    custom_salt_buffer: SecureInputBuffer,
 }
 
 impl NightbaronApp {
@@ -239,9 +323,9 @@ impl NightbaronApp {
             delete_original: false,
             sender,
             receiver,
-            encrypt_pass_buffer: String::new(),
-            decrypt_pass_buffer: String::new(),
-            custom_salt_buffer: String::new(),
+            encrypt_pass_buffer: SecureInputBuffer::new(),
+            decrypt_pass_buffer: SecureInputBuffer::new(),
+            custom_salt_buffer: SecureInputBuffer::new(),
         }
     }
 
@@ -318,8 +402,8 @@ impl eframe::App for NightbaronApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.heading("NIGHTBARON");
-                ui.label("File Encryption System");
+                ui.heading(crate::vmp::ui_str_nightbaron());
+                ui.label(crate::vmp::ui_str_file_encryption_system());
             });
             
             ui.add_space(20.0);
@@ -337,7 +421,7 @@ impl eframe::App for NightbaronApp {
 
             match self.current_tab {
                 Tab::Encrypt => {
-                    ui.label("Select a folder to encrypt:");
+                    ui.label(crate::vmp::ui_str_select_folder());
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut self.encrypt_path);
                         if ui.button("...").clicked() && !self.is_processing {
@@ -348,56 +432,90 @@ impl eframe::App for NightbaronApp {
                     });
 
                     ui.add_space(10.0);
-                    ui.label("Password:");
-                    ui.add(egui::TextEdit::singleline(&mut self.encrypt_pass_buffer).password(true));
+                    ui.label(crate::vmp::ui_str_password());
 
-                    ui.add_space(20.0);
-                    
-                    let btn = egui::Button::new("ENCRYPT");
-                    
-                    if ui.add_enabled(!self.is_processing, btn).clicked() {
-                        if !self.encrypt_pass_buffer.is_empty() {
-                            self.encrypt_pass.update_from_buffer(&mut self.encrypt_pass_buffer);
-                        }
-                        if !self.custom_salt_buffer.is_empty() {
-                            self.custom_salt.update_from_buffer(&mut self.custom_salt_buffer);
-                        }
-                        if self.encrypt_path.is_empty() || self.encrypt_pass.is_empty() {
-                            self.status_message = "Please fill in all fields".to_owned();
-                        } else if !Path::new(&self.encrypt_path).exists() {
-                            self.status_message = "Selected path does not exist".to_owned();
-                        } else {
-                            let path = self.encrypt_path.clone();
-                            let mut pass_buffer = self.encrypt_pass.as_str();
-                            let sender = self.sender.clone();
-                            
-                            let options = crypto::EncryptionOptions {
-                                custom_salt: if self.custom_salt.is_empty() { None } else { Some(self.custom_salt.as_str().to_string()) },
-                                delete_original: self.delete_original,
-                            };
-                            
-                            self.status_message = "Starting encryption...".to_owned();
-                            self.is_processing = true;
-                            
-                            thread::spawn(move || {
-                                sender.send(AppMessage::EncryptStart).ok();
-                                match crypto::encrypt_folder(&path, &pass_buffer, options) {
-                                    Ok(filename) => {
-                                        sender.send(AppMessage::EncryptComplete(filename)).ok();
-                                    },
-                                    Err(e) => {
-                                        sender.send(AppMessage::EncryptError(e.to_string())).ok();
+                    // Secure password input - never stores plain text
+                    let mut display_text = "*".repeat(self.encrypt_pass_buffer.len());
+                    let response = ui.add(egui::TextEdit::singleline(&mut display_text).password(true));
+
+                    // Handle input events to securely capture password
+                    if response.changed() || response.lost_focus() {
+                        // Reset display to correct length
+                        display_text = "*".repeat(self.encrypt_pass_buffer.len());
+                    }
+
+                    // Capture new input characters
+                    ui.input(|i| {
+                        for event in &i.events {
+                            match event {
+                                egui::Event::Text(text) => {
+                                    for ch in text.chars() {
+                                        if ch.is_ascii() && !ch.is_control() {
+                                            self.encrypt_pass_buffer.push(ch);
+                                        }
                                     }
                                 }
-                                pass_buffer.zeroize();
-                            });
-                            self.encrypt_pass.zeroize();
-                            self.encrypt_pass.clear();
+                                egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                                    self.encrypt_pass_buffer.pop();
+                                }
+                                _ => {}
+                            }
                         }
+                    });
+
+                    ui.add_space(20.0);
+
+                    let btn = egui::Button::new(crate::vmp::ui_str_encrypt());
+                    
+                    if ui.add_enabled(!self.is_processing, btn).clicked() {
+                        vmp_ultra!("encrypt_button_handler", {
+                            if !self.encrypt_pass_buffer.is_empty() {
+                                let mut plain_pass = self.encrypt_pass_buffer.as_string();
+                                self.encrypt_pass.update_from_buffer(&mut plain_pass);
+                                self.encrypt_pass_buffer.clear();
+                            }
+                            if !self.custom_salt_buffer.is_empty() {
+                                let mut plain_salt = self.custom_salt_buffer.as_string();
+                                self.custom_salt.update_from_buffer(&mut plain_salt);
+                                self.custom_salt_buffer.clear();
+                            }
+                            if self.encrypt_path.is_empty() || self.encrypt_pass.is_empty() {
+                                self.status_message = "Please fill in all fields".to_owned();
+                            } else if !Path::new(&self.encrypt_path).exists() {
+                                self.status_message = "Selected path does not exist".to_owned();
+                            } else {
+                                let path = self.encrypt_path.clone();
+                                let mut pass_buffer = self.encrypt_pass.as_str();
+                                let sender = self.sender.clone();
+
+                                let options = crypto::EncryptionOptions {
+                                    custom_salt: if self.custom_salt.is_empty() { None } else { Some(self.custom_salt.as_str().to_string()) },
+                                    delete_original: self.delete_original,
+                                };
+
+                                self.status_message = "Starting encryption...".to_owned();
+                                self.is_processing = true;
+
+                                thread::spawn(move || {
+                                    sender.send(AppMessage::EncryptStart).ok();
+                                    match crypto::encrypt_folder(&path, &pass_buffer, options) {
+                                        Ok(filename) => {
+                                            sender.send(AppMessage::EncryptComplete(filename)).ok();
+                                        },
+                                        Err(e) => {
+                                            sender.send(AppMessage::EncryptError(e.to_string())).ok();
+                                        }
+                                    }
+                                    pass_buffer.zeroize();
+                                });
+                                self.encrypt_pass.zeroize();
+                                self.encrypt_pass.clear();
+                            }
+                        })
                     }
                 }
                 Tab::Decrypt => {
-                    ui.label("Select a .nightbaron file to decrypt:");
+                    ui.label(crate::vmp::ui_str_select_file());
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut self.decrypt_path);
                         if ui.button("...").clicked() && !self.is_processing {
@@ -408,44 +526,72 @@ impl eframe::App for NightbaronApp {
                     });
 
                     ui.add_space(10.0);
-                    ui.label("Password:");
-                    ui.add(egui::TextEdit::singleline(&mut self.decrypt_pass_buffer).password(true));
+                    ui.label(crate::vmp::ui_str_password());
+
+                    let mut display_text = "*".repeat(self.decrypt_pass_buffer.len());
+                    let response = ui.add(egui::TextEdit::singleline(&mut display_text).password(true));
+
+                    if response.changed() || response.lost_focus() {
+                        display_text = "*".repeat(self.decrypt_pass_buffer.len());
+                    }
+
+                    ui.input(|i| {
+                        for event in &i.events {
+                            match event {
+                                egui::Event::Text(text) => {
+                                    for ch in text.chars() {
+                                        if ch.is_ascii() && !ch.is_control() {
+                                            self.decrypt_pass_buffer.push(ch);
+                                        }
+                                    }
+                                }
+                                egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                                    self.decrypt_pass_buffer.pop();
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
 
                     ui.add_space(20.0);
 
-                    let btn = egui::Button::new("DECRYPT");
+                    let btn = egui::Button::new(crate::vmp::ui_str_decrypt());
                     
                     if ui.add_enabled(!self.is_processing, btn).clicked() {
-                        if !self.decrypt_pass_buffer.is_empty() {
-                            self.decrypt_pass.update_from_buffer(&mut self.decrypt_pass_buffer);
-                        }
-                        if self.decrypt_path.is_empty() || self.decrypt_pass.is_empty() {
-                            self.status_message = "Please fill in all fields".to_owned();
-                        } else if !self.decrypt_path.ends_with(".nightbaron") {
-                            self.status_message = "Please select a .nightbaron file".to_owned();
-                        } else {
-                            let path = self.decrypt_path.clone();
-                            let mut pass_buffer = self.decrypt_pass.as_str();
-                            let sender = self.sender.clone();
+                        vmp_ultra!("decrypt_button_handler", {
+                            if !self.decrypt_pass_buffer.is_empty() {
+                                let mut plain_pass = self.decrypt_pass_buffer.as_string();
+                                self.decrypt_pass.update_from_buffer(&mut plain_pass);
+                                self.decrypt_pass_buffer.clear();
+                            }
+                            if self.decrypt_path.is_empty() || self.decrypt_pass.is_empty() {
+                                self.status_message = "Please fill in all fields".to_owned();
+                            } else if !self.decrypt_path.ends_with(".nightbaron") {
+                                self.status_message = "Please select a .nightbaron file".to_owned();
+                            } else {
+                                let path = self.decrypt_path.clone();
+                                let mut pass_buffer = self.decrypt_pass.as_str();
+                                let sender = self.sender.clone();
 
-                            self.status_message = "Starting decryption...".to_owned();
-                            self.is_processing = true;
+                                self.status_message = "Starting decryption...".to_owned();
+                                self.is_processing = true;
 
-                            thread::spawn(move || {
-                                sender.send(AppMessage::DecryptStart).ok();
-                                match crypto::decrypt_file(&path, &pass_buffer) {
-                                    Ok(msg) => {
-                                        sender.send(AppMessage::DecryptComplete(msg)).ok();
-                                    },
-                                    Err(e) => {
-                                        sender.send(AppMessage::DecryptError(e.to_string())).ok();
+                                thread::spawn(move || {
+                                    sender.send(AppMessage::DecryptStart).ok();
+                                    match crypto::decrypt_file(&path, &pass_buffer) {
+                                        Ok(msg) => {
+                                            sender.send(AppMessage::DecryptComplete(msg)).ok();
+                                        },
+                                        Err(e) => {
+                                            sender.send(AppMessage::DecryptError(e.to_string())).ok();
+                                        }
                                     }
-                                }
-                                pass_buffer.zeroize();
-                            });
-                            self.decrypt_pass.zeroize();
-                            self.decrypt_pass.clear();
-                        }
+                                    pass_buffer.zeroize();
+                                });
+                                self.decrypt_pass.zeroize();
+                                self.decrypt_pass.clear();
+                            }
+                        })
                     }
                 }
                 Tab::Settings => {
@@ -453,7 +599,31 @@ impl eframe::App for NightbaronApp {
                     ui.add_space(10.0);
                     
                     ui.label("Custom Salt (Optional):");
-                    ui.add(egui::TextEdit::singleline(&mut self.custom_salt_buffer));
+
+                    let mut display_text = "*".repeat(self.custom_salt_buffer.len());
+                    let response = ui.add(egui::TextEdit::singleline(&mut display_text));
+
+                    if response.changed() || response.lost_focus() {
+                        display_text = "*".repeat(self.custom_salt_buffer.len());
+                    }
+
+                    ui.input(|i| {
+                        for event in &i.events {
+                            match event {
+                                egui::Event::Text(text) => {
+                                    for ch in text.chars() {
+                                        if ch.is_ascii() && !ch.is_control() {
+                                            self.custom_salt_buffer.push(ch);
+                                        }
+                                    }
+                                }
+                                egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                                    self.custom_salt_buffer.pop();
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
                     ui.label(egui::RichText::new("Leave empty to use a random salt (Recommended)").small().weak());
                     
                     ui.add_space(10.0);
