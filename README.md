@@ -10,4 +10,7 @@ The main purpose is to make it economically infeasible to bruteforce the encrypt
 * Modern UI
 * Memory erasure after closure (at runtime)
 
+VMP Branch:
+This version will not reveal input strings and will make live memory dumps completely useless for most attackers. (Requires VMP)
+
 **License:** GNU Affero General Public License v3.0
