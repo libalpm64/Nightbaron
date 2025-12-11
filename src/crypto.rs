@@ -6,7 +6,7 @@ use chacha20poly1305::{
 use rand::RngCore;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, Read, Write, BufReader, BufWriter};
+use std::io::{self, Read, Write, BufReader, BufWriter, Cursor};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -14,6 +14,8 @@ use tar::Builder;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use xz2::write::XzEncoder; 
 use xz2::read::XzDecoder;
+use zstd::stream::write::Encoder as ZstdEncoder;
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
@@ -30,12 +32,18 @@ pub enum Argon2Difficulty {
     Paranoid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompressionMethod {
+    Xz,
+    Zstd,
+}
+
 pub struct EncryptionOptions {
     pub custom_salt: Option<String>,
     pub delete_original: bool,
     pub difficulty: Argon2Difficulty,
-    pub compression_level: u32,
-    pub smart_compression: bool,
+    pub compression_method: CompressionMethod,
+    pub compression_level: u32, // 0-9 for XZ, 1-21 for ZSTD (though we might map 0-9 to decent zstd levels)
     pub split_size: Option<usize>,
     pub block_size: usize,
 }
@@ -57,12 +65,19 @@ fn is_already_compressed(path: &Path) -> bool {
     false
 }
 
-fn should_compress(folder_path: &str) -> bool {
+/pub fn should_compress<F>(folder_path: &str, report_progress: F) -> bool 
+where F: Fn(String) {
     let mut compressed_size: u64 = 0;
     let mut total_size: u64 = 0;
+    let mut file_count = 0;
 
     for entry in WalkDir::new(folder_path).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
+            file_count += 1;
+            if file_count % 100 == 0 {
+                report_progress(format!("Analyzing file {}...", file_count));
+            }
+            
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             total_size += size;
             if is_already_compressed(entry.path()) {
@@ -131,7 +146,6 @@ impl Write for SplitWriter {
         while !slice.is_empty() {
             if let Some(limit) = self.split_size {
                 if self.current_size >= limit {
-                    // Rotate file
                     self.current_file.flush()?;
                     self.current_part += 1;
                     
@@ -196,7 +210,7 @@ impl<W: Write> EncryptingWriter<W> {
         let ciphertext = self.cipher.encrypt(nonce, self.buffer.as_slice())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-        // Nonce + Len + Ciphertext (format)
+        // Format: Nonce(12) + Length(4) + Ciphertext
         self.inner.write_all(&nonce_bytes)?;
         let len = ciphertext.len() as u32;
         self.inner.write_all(&len.to_le_bytes())?;
@@ -213,17 +227,17 @@ impl<W: Write> Write for EncryptingWriter<W> {
         let mut input = buf;
 
         while !input.is_empty() {
-            let space = self.block_size - self.buffer.len();
-            if input.len() <= space {
-                self.buffer.extend_from_slice(input);
-                total_written += input.len();
-                break;
-            } else {
-                self.buffer.extend_from_slice(&input[..space]);
-                self.flush_buffer()?;
-                total_written += space;
-                input = &input[space..];
-            }
+             let space = self.block_size - self.buffer.len();
+             if input.len() <= space {
+                 self.buffer.extend_from_slice(input);
+                 total_written += input.len();
+                 break;
+             } else {
+                 self.buffer.extend_from_slice(&input[..space]);
+                 self.flush_buffer()?;
+                 total_written += space;
+                 input = &input[space..];
+             }
         }
         Ok(total_written)
     }
@@ -240,7 +254,76 @@ impl<W: Write> Drop for EncryptingWriter<W> {
     }
 }
 
-pub fn encrypt_folder(folder_path: &str, password: &str, options: EncryptionOptions) -> io::Result<String> {
+struct DecryptingReader<R: Read> {
+    inner: R,
+    cipher: ChaCha20Poly1305,
+    buffer: Vec<u8>,
+    pos: usize,
+    eof: bool,
+}
+
+impl<R: Read> DecryptingReader<R> {
+    fn new(inner: R, key: Key) -> Self {
+        Self {
+            inner,
+            cipher: ChaCha20Poly1305::new(&key),
+            buffer: Vec::new(),
+            pos: 0,
+            eof: false,
+        }
+    }
+
+    fn fill_buffer(&mut self) -> io::Result<bool> {
+        if self.eof { return Ok(false); }
+
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        match self.inner.read_exact(&mut nonce_bytes) {
+            Ok(_) => {},
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                self.eof = true;
+                return Ok(false);
+            },
+            Err(e) => return Err(e),
+        }
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let mut len_bytes = [0u8; 4];
+        self.inner.read_exact(&mut len_bytes)?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+
+        let mut ciphertext = vec![0u8; len];
+        self.inner.read_exact(&mut ciphertext)?;
+
+        let plaintext = self.cipher.decrypt(nonce, ciphertext.as_ref())
+             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))?;
+        
+        self.buffer = plaintext;
+        self.pos = 0;
+        Ok(true)
+    }
+}
+
+impl<R: Read> Read for DecryptingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.buffer.len() {
+             if !self.fill_buffer()? {
+                 return Ok(0); // EOF
+             }
+        }
+
+        let available = self.buffer.len() - self.pos;
+        let read_len = std::cmp::min(available, buf.len());
+        
+        buf[..read_len].copy_from_slice(&self.buffer[self.pos..self.pos + read_len]);
+        self.pos += read_len;
+        
+        Ok(read_len)
+    }
+}
+
+
+pub fn encrypt_folder<F>(folder_path: &str, password: &str, options: EncryptionOptions, report_progress: F) -> io::Result<String>
+where F: Fn(String) {
     let path = Path::new(folder_path);
     if !path.exists() || !path.is_dir() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "Folder not found"));
@@ -250,7 +333,18 @@ pub fn encrypt_folder(folder_path: &str, password: &str, options: EncryptionOpti
     let parent_dir = path.parent().unwrap_or(Path::new("."));
     let output_filename = parent_dir.join(format!("{}.nightbaron", folder_name));
     
-    // salt and key derivation
+    let mut use_zstd = false;
+    let mut use_xz = false;
+
+    if should_compress(folder_path, &report_progress) {
+        match options.compression_method {
+            CompressionMethod::Zstd => use_zstd = true,
+            CompressionMethod::Xz => use_xz = true,
+        }
+    } else {
+        report_progress("Skipping compression (files already compressed)".to_string());
+    }
+
     let mut salt = [0u8; SALT_LEN];
     if let Some(custom) = options.custom_salt {
         let bytes = custom.as_bytes();
@@ -264,11 +358,12 @@ pub fn encrypt_folder(folder_path: &str, password: &str, options: EncryptionOpti
         rand::thread_rng().fill_bytes(&mut salt);
     }
     
+    report_progress("Deriving keys...".to_string());
     let mut key_bytes = SensitiveData(derive_key(password.as_bytes(), &salt, options.difficulty).to_vec());
     let key = *Key::from_slice(&key_bytes.0);
-    let mut split_writer = SplitWriter::new(PathBuf::from(&output_filename), options.split_size)?;
 
-    // writer header (salt + difficulty)
+    let mut split_writer = SplitWriter::new(PathBuf::from(&output_filename), options.split_size)?;
+    
     split_writer.write_all(&salt)?;
     let difficulty_byte = match options.difficulty {
         Argon2Difficulty::Light => 1u8,
@@ -279,30 +374,36 @@ pub fn encrypt_folder(folder_path: &str, password: &str, options: EncryptionOpti
     };
     split_writer.write_all(&[difficulty_byte])?; 
 
-    // encrypting writer (creates chunks then encrypts to writer buffer)
-    let block_size = if options.block_size == 0 { 64 * 1024 * 1024 } else { options.block_size };
+    let method_byte = if use_zstd { 2u8 } else if use_xz { 1u8 } else { 0u8 };
+    split_writer.write_all(&[method_byte])?;
+
+    report_progress("Encrypting (Streaming)...".to_string());
+    let block_size = if options.block_size == 0 { 64 * 1024 * 1024 } else { options.block_size };    
     let encrypting_writer = EncryptingWriter::new(split_writer, key, block_size);
-
-    let level = if options.smart_compression && !should_compress(folder_path) {
-        0 
-    } else {
-        options.compression_level
-    };
-
-    if level > 0 {
-        let mut encoder = XzEncoder::new(encrypting_writer, level);
+    
+    if use_zstd {
+        let level = if options.compression_level > 0 { options.compression_level as i32 } else { 3 };
+        let mut zstd_enc = ZstdEncoder::new(encrypting_writer, level)?;
         {
-            let mut tar_builder = Builder::new(&mut encoder);
-            tar_builder.append_dir_all(folder_name, folder_path)?;
-            tar_builder.finish()?;
+            let mut tar = Builder::new(&mut zstd_enc);
+            tar.append_dir_all(folder_name, folder_path)?;
+            tar.finish()?;
         }
-        encoder.finish()?;
+        zstd_enc.finish()?;
+    } else if use_xz {
+        let level = if options.compression_level > 9 { 6 } else { options.compression_level };
+        let mut xz_enc = XzEncoder::new(encrypting_writer, level);
+        {
+             let mut tar = Builder::new(&mut xz_enc);
+             tar.append_dir_all(folder_name, folder_path)?;
+             tar.finish()?;
+        }
+        xz_enc.finish()?;
     } else {
-        // Exception (Just store rather than running compression)
-        // if -1 that means no compression
-        let mut tar_builder = Builder::new(encrypting_writer);
-        tar_builder.append_dir_all(folder_name, folder_path)?;
-        tar_builder.finish()?;
+        // No compression
+        let mut tar = Builder::new(encrypting_writer);
+        tar.append_dir_all(folder_name, folder_path)?;
+        tar.finish()?;
     }
 
     key_bytes.zeroize();
@@ -358,7 +459,69 @@ impl Read for MultiPartReader {
     }
 }
 
-pub fn decrypt_file(file_path: &str, password: &str) -> io::Result<String> {
+pub fn decrypt_file<F>(file_path: &str, password: &str, report_progress: F) -> io::Result<String>
+where F: Fn(String) {
+    if let Ok(res) = try_decrypt_v2(file_path, password, &report_progress) {
+        return Ok(res);
+    }
+    
+    report_progress("V2 failed, attempting legacy V1 decryption...".to_string());
+    decrypt_v1(file_path, password, &report_progress)
+}
+
+fn try_decrypt_v2<F>(file_path: &str, password: &str, report_progress: F) -> io::Result<String>
+where F: Fn(String) {
+    let mut reader = MultiPartReader::open(file_path)?;
+    let mut salt = [0u8; SALT_LEN];
+    reader.read_exact(&mut salt)?;
+    
+    let mut diff_byte = [0u8; 1];
+    reader.read_exact(&mut diff_byte)?;
+    
+    let mut method_byte = [0u8; 1];
+    reader.read_exact(&mut method_byte)?;
+
+    let difficulty = match diff_byte[0] {
+        1 => Argon2Difficulty::Light,
+        2 => Argon2Difficulty::Low,
+        3 => Argon2Difficulty::Medium,
+        4 => Argon2Difficulty::Hard,
+        5 => Argon2Difficulty::Paranoid,
+        _ => Argon2Difficulty::Medium,
+    };
+    
+    let method = match method_byte[0] {
+        1 => CompressionMethod::Xz,
+        2 => CompressionMethod::Zstd,
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown compression method, possibly V1")),
+    };
+    
+    report_progress("Deriving keys (V2)...".to_string());
+    let mut key_bytes = SensitiveData(derive_key(password.as_bytes(), &salt, difficulty).to_vec());
+    let key = Key::from_slice(&key_bytes.0);
+    
+    report_progress("Decrypting & Extracting (V2)...".to_string());
+    
+    let decrypt_stream = DecryptingReader::new(reader, *key);
+    let p = Path::new(file_path);
+    let parent = p.parent().unwrap_or(Path::new("."));
+
+    if method == CompressionMethod::Zstd {
+         let decoder = ZstdDecoder::new(decrypt_stream)?;
+         let mut archive = tar::Archive::new(decoder);
+         archive.unpack(parent)?;
+    } else {
+         let decoder = XzDecoder::new(decrypt_stream);
+         let mut archive = tar::Archive::new(decoder);
+         archive.unpack(parent)?;
+    }
+    
+    key_bytes.zeroize();
+    Ok("Decryption Successful".to_string())
+}
+
+fn decrypt_v1<F>(file_path: &str, password: &str, report_progress: F) -> io::Result<String>
+where F: Fn(String) {
     let mut reader = MultiPartReader::open(file_path)?;
 
     let mut salt = [0u8; SALT_LEN];
@@ -366,6 +529,8 @@ pub fn decrypt_file(file_path: &str, password: &str) -> io::Result<String> {
     
     let mut diff_byte = [0u8; 1];
     reader.read_exact(&mut diff_byte)?;
+    
+    // V1 has NO method byte (backwards compatibility)
     
     let difficulty = match diff_byte[0] {
         1 => Argon2Difficulty::Light,
@@ -375,65 +540,36 @@ pub fn decrypt_file(file_path: &str, password: &str) -> io::Result<String> {
         5 => Argon2Difficulty::Paranoid,
         _ => Argon2Difficulty::Medium,
     };
-
+    
+    report_progress("Deriving keys (V1)...".to_string());
     let mut key_bytes = SensitiveData(derive_key(password.as_bytes(), &salt, difficulty).to_vec());
     let key = Key::from_slice(&key_bytes.0);
-    let cipher = ChaCha20Poly1305::new(key);
-
-    let output_tar = file_path.replace(".nightbaron", ".tar");
-    let temp_output = format!("{}.temp", output_tar);
     
-    {
-        let output_file = File::create(&temp_output)?;
-        let mut writer = BufWriter::new(output_file);
-
-        loop {
-            let mut nonce_bytes = [0u8; NONCE_LEN];
-            match reader.read_exact(&mut nonce_bytes) {
-                Ok(_) => {},
-                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
-            let nonce = Nonce::from_slice(&nonce_bytes);
-
-            let mut len_bytes = [0u8; 4];
-            reader.read_exact(&mut len_bytes)?;
-            let len = u32::from_le_bytes(len_bytes) as usize;
-
-            let mut ciphertext = vec![0u8; len];
-            reader.read_exact(&mut ciphertext)?;
-
-            let mut plaintext = SensitiveData(
-                cipher.decrypt(nonce, ciphertext.as_ref())
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))?
-            );
-
-            writer.write_all(&plaintext.0)?;
-            plaintext.zeroize();
-        }
-        writer.flush()?;
-    }
-
-    key_bytes.zeroize();
+    report_progress("Decrypting & Extracting (V1)...".to_string());
     
-    let mut file = File::open(&temp_output)?;
+    let mut decrypt_stream = DecryptingReader::new(reader, *key);
+    
+    // Detetct magic inside decrypted stream by peeking
     let mut magic = [0u8; 6];
-    let bytes_read = file.read(&mut magic)?;
-    file = File::open(&temp_output)?; 
-
-    // XZ Magic: FD 37 7A 58 5A 00
-    let is_xz = bytes_read >= 6 && magic == [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];
-    
-    if is_xz {
-        let decoder = XzDecoder::new(file);
-        let mut archive = tar::Archive::new(decoder);
-        archive.unpack(".")?;
-    } else {
-        let mut archive = tar::Archive::new(file);
-        archive.unpack(".")?;
+    if decrypt_stream.read(&mut magic)? < 6 {
+         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "File too short"));
     }
     
-    fs::remove_file(&temp_output)?;
+    let is_xz = magic == [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];
+    let stream = Cursor::new(magic).chain(decrypt_stream);
     
-    Ok("Done!".to_string())
+    let p = Path::new(file_path);
+    let parent = p.parent().unwrap_or(Path::new("."));
+
+    if is_xz {
+        let decoder = XzDecoder::new(stream);
+        let mut archive = tar::Archive::new(decoder);
+        archive.unpack(parent)?;
+    } else {
+        let mut archive = tar::Archive::new(stream);
+        archive.unpack(parent)?;
+    }
+    
+    key_bytes.zeroize();
+    Ok("Decryption Successful (V1)".to_string())
 }

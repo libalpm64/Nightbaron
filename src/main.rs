@@ -109,8 +109,8 @@ struct NightbaronApp {
     encrypt_pass_buffer: String,
     decrypt_pass_buffer: String,
     custom_salt_buffer: String,
+    compression_method: crypto::CompressionMethod,
     compression_level: u32,
-    smart_compression: bool,
     difficulty: Argon2Difficulty,
     enable_split: bool,
     split_size_mb: u32,
@@ -136,8 +136,8 @@ impl NightbaronApp {
             encrypt_pass_buffer: String::new(),
             decrypt_pass_buffer: String::new(),
             custom_salt_buffer: String::new(),
+            compression_method: crypto::CompressionMethod::Zstd,
             compression_level: 1,
-            smart_compression: true,
             difficulty: Argon2Difficulty::Medium,
             enable_split: false,
             split_size_mb: 100,
@@ -202,6 +202,9 @@ impl NightbaronApp {
                     self.is_processing = false;
                 }
                 AppMessage::Log(msg) => {
+                    if msg.starts_with("Analyzing") || msg.starts_with("Encrypting") || msg.starts_with("Decrypting") || msg.starts_with("Deriving") {
+                         self.status_message = msg.clone();
+                    }
                     self.add_log(msg);
                 }
             }
@@ -248,6 +251,10 @@ impl eframe::App for NightbaronApp {
                     ui.label("Password:");
                     ui.add(egui::TextEdit::singleline(&mut self.encrypt_pass_buffer).password(true));
 
+                    ui.add_space(10.0);
+
+
+
                     ui.add_space(20.0);
                     
                     let btn = egui::Button::new("ENCRYPT");
@@ -267,13 +274,14 @@ impl eframe::App for NightbaronApp {
                             let path = self.encrypt_path.clone();
                             let mut pass_buffer = self.encrypt_pass.as_str();
                             let sender = self.sender.clone();
+                            let progress_sender = self.sender.clone();
                             
                             let options = crypto::EncryptionOptions {
                                 custom_salt: if self.custom_salt.is_empty() { None } else { Some(self.custom_salt.as_str().to_string()) },
                                 delete_original: self.delete_original,
                                 difficulty: self.difficulty,
+                                compression_method: self.compression_method,
                                 compression_level: self.compression_level,
-                                smart_compression: self.smart_compression,
                                 split_size: if self.enable_split { Some(self.split_size_mb as usize * 1024 * 1024) } else { None },
                                 block_size: self.block_size_mb as usize * 1024 * 1024,
                             };
@@ -283,7 +291,11 @@ impl eframe::App for NightbaronApp {
                             
                             thread::spawn(move || {
                                 sender.send(AppMessage::EncryptStart).ok();
-                                match crypto::encrypt_folder(&path, &pass_buffer, options) {
+                                let res = crypto::encrypt_folder(&path, &pass_buffer, options, |msg| {
+                                     progress_sender.send(AppMessage::Log(msg)).ok();
+                                });
+
+                                match res {
                                     Ok(filename) => {
                                         sender.send(AppMessage::EncryptComplete(filename)).ok();
                                     },
@@ -327,13 +339,18 @@ impl eframe::App for NightbaronApp {
                             let path = self.decrypt_path.clone();
                             let mut pass_buffer = self.decrypt_pass.as_str();
                             let sender = self.sender.clone();
+                            let progress_sender = self.sender.clone();
 
                             self.status_message = "Starting decryption...".to_owned();
                             self.is_processing = true;
 
                             thread::spawn(move || {
                                 sender.send(AppMessage::DecryptStart).ok();
-                                match crypto::decrypt_file(&path, &pass_buffer) {
+                                let res = crypto::decrypt_file(&path, &pass_buffer, |msg| {
+                                     progress_sender.send(AppMessage::Log(msg)).ok();
+                                });
+                                
+                                match res {
                                     Ok(msg) => {
                                         sender.send(AppMessage::DecryptComplete(msg)).ok();
                                     },
@@ -365,9 +382,22 @@ impl eframe::App for NightbaronApp {
 
                         ui.group(|ui| {
                             ui.label("Compression");
-                            ui.checkbox(&mut self.smart_compression, "Smart Compression");
-                            ui.add(egui::Slider::new(&mut self.compression_level, 0..=9).text("Compression Level"));
+                            let mut is_xz = matches!(self.compression_method, crypto::CompressionMethod::Xz);
+                            if ui.checkbox(&mut is_xz, "LZMA (High Ratio)").clicked() {
+                                self.compression_method = crypto::CompressionMethod::Xz;
+                            }
+
+                            let mut is_zstd = matches!(self.compression_method, crypto::CompressionMethod::Zstd);
+                            if ui.checkbox(&mut is_zstd, "ZSTD (Fast)").clicked() {
+                                self.compression_method = crypto::CompressionMethod::Zstd;
+                            }
+                            
+                            ui.add_space(5.0);
+                            ui.label("Compression Level:");
+                            ui.add(egui::Slider::new(&mut self.compression_level, 0..=9).text("Level (0-9 for XZ, mapped for ZSTD)"));
                         });
+
+                        ui.add_space(10.0);
                         ui.add_space(10.0);
 
                         ui.group(|ui| {
@@ -384,7 +414,7 @@ impl eframe::App for NightbaronApp {
                                     ui.add(egui::DragValue::new(&mut self.split_size_mb).range(1..=10000));
                                 });
                                 if self.split_size_mb < self.block_size_mb {
-                                    ui.label(egui::RichText::new("Note: Volumes has to atleast be their block sizes.").color(egui::Color32::YELLOW));
+                                    ui.label(egui::RichText::new("Note: Volumes will be at least Block Size").color(egui::Color32::YELLOW));
                                 }
                             }
                         });
