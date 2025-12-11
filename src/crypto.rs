@@ -65,7 +65,7 @@ fn is_already_compressed(path: &Path) -> bool {
     false
 }
 
-/pub fn should_compress<F>(folder_path: &str, report_progress: F) -> bool 
+pub fn should_compress<F>(folder_path: &str, report_progress: F) -> bool 
 where F: Fn(String) {
     let mut compressed_size: u64 = 0;
     let mut total_size: u64 = 0;
@@ -572,4 +572,5 @@ where F: Fn(String) {
     
     key_bytes.zeroize();
     Ok("Decryption Successful (V1)".to_string())
+
 }
