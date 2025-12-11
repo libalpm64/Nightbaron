@@ -6,7 +6,6 @@ use std::thread;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
-use memsec;
 
 #[derive(Clone)]
 struct SecureString {
@@ -27,32 +26,7 @@ impl SecureString {
     }
     
     fn allocate_secure(capacity: usize) -> Vec<u8> {
-        #[cfg(windows)]
-        {
-            unsafe {
-                use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};                
-                const PAGE_SIZE: usize = 4096;
-                let total_size = capacity + (2 * PAGE_SIZE);
-                
-                let ptr = VirtualAlloc(
-                    std::ptr::null_mut(),
-                    total_size,
-                    MEM_COMMIT | MEM_RESERVE,
-                    PAGE_READWRITE
-                );
-                
-                if ptr.is_null() {
-                    Vec::with_capacity(capacity)
-                } else {
-                    let data_start = ptr.add(PAGE_SIZE) as *mut u8;
-                    Vec::from_raw_parts(data_start, 0, capacity)
-                }
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            Vec::with_capacity(capacity)
-        }
+        Vec::with_capacity(capacity)
     }
     
     fn obfuscate_data(&mut self) {
@@ -60,11 +34,6 @@ impl SecureString {
             *byte ^= self.obfuscation_key[i % self.obfuscation_key.len()];
         }
     }
-    
-    fn deobfuscate_data(&mut self) {
-        self.obfuscate_data();
-    }
-    
     
     fn as_str(&self) -> String {
         let mut temp_data = self.data.clone();
@@ -88,94 +57,23 @@ impl SecureString {
     }
     
     fn update_from_buffer(&mut self, buffer: &mut String) {
-        if !self.data.is_empty() {
-            unsafe { memsec::munlock(self.data.as_mut_ptr(), self.data.len()) };
-        }
-        
         self.data.zeroize();
-        
-        if buffer.len() > 64 {
-            self.data = Self::allocate_secure(buffer.len());
-            self.data.extend_from_slice(buffer.as_bytes());
-        } else {
-            self.data.clear();
-            self.data.extend_from_slice(buffer.as_bytes());
-        }
+        self.data.clear();
+        self.data.extend_from_slice(buffer.as_bytes());
         self.obfuscate_data();
-        
-        if !self.data.is_empty() {
-            unsafe { memsec::mlock(self.data.as_mut_ptr(), self.data.len()) };
-        }
-        
         buffer.zeroize();
         buffer.clear();
-    }
-    
-    fn constant_time_eq(&self, other: &SecureString) -> bool {
-        if self.data.len() != other.data.len() {
-            return false;
-        }
-        
-        let mut temp_self = self.data.clone();
-        let mut temp_other = other.data.clone();
-        
-        for (i, byte) in temp_self.iter_mut().enumerate() {
-            *byte ^= self.obfuscation_key[i % self.obfuscation_key.len()];
-        }
-        for (i, byte) in temp_other.iter_mut().enumerate() {
-            *byte ^= other.obfuscation_key[i % other.obfuscation_key.len()];
-        }
-        
-        let mut result = 0u8;
-        for (a, b) in temp_self.iter().zip(temp_other.iter()) {
-            result |= a ^ b;
-        }
-        
-        temp_self.zeroize();
-        temp_other.zeroize();
-        
-        result == 0
     }
 }
 
 impl Drop for SecureString {
     fn drop(&mut self) {
-        if !self.data.is_empty() {
-            unsafe { memsec::munlock(self.data.as_mut_ptr(), self.data.len()) };
-        }
         self.data.zeroize();
     }
 }
 
-
-#[cfg(target_os = "linux")]
-use dbus::blocking::Connection;
-#[cfg(target_os = "linux")]
-use std::thread;
-
-#[cfg(windows)]
-use windows_sys::Win32::System::Power::PowerRegisterSuspendResumeNotification;
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::HANDLE;
-#[cfg(windows)]
-use std::ffi::c_void;
-#[cfg(windows)]
-use std::sync::mpsc::Sender as MpscSender;
-#[cfg(windows)]
-use std::sync::Mutex;
-
-#[cfg(windows)]
-static WINDOWS_SUSPEND_SENDER: Mutex<Option<MpscSender<AppMessage>>> = Mutex::new(None);
-
-#[cfg(unix)]
-use libc::prctl;
-#[cfg(unix)]
-const PR_SET_DUMPABLE: i32 = 4;
-
-#[cfg(windows)]
-use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS};
-
 mod crypto;
+use crypto::Argon2Difficulty;
 
 enum AppMessage {
     EncryptStart,
@@ -185,7 +83,6 @@ enum AppMessage {
     DecryptComplete(String),
     DecryptError(String),
     Log(String),
-    SuspendDetected,
 }
 
 #[derive(PartialEq)]
@@ -212,18 +109,15 @@ struct NightbaronApp {
     encrypt_pass_buffer: String,
     decrypt_pass_buffer: String,
     custom_salt_buffer: String,
+    compression_level: u32,
+    smart_compression: bool,
+    difficulty: Argon2Difficulty,
+    enable_split: bool,
+    split_size_mb: u32,
+    block_size_mb: u32,
 }
 
 impl NightbaronApp {
-    fn zeroize_sensitive_data(&mut self) {
-        self.encrypt_pass.zeroize();
-        self.encrypt_pass.clear();
-        self.decrypt_pass.zeroize();
-        self.decrypt_pass.clear();
-        self.custom_salt.zeroize();
-        self.custom_salt.clear();
-        self.add_log("Sensitive data zeroized due to suspend/sleep event".to_owned());
-    }
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (sender, receiver) = channel();
         Self {
@@ -242,6 +136,12 @@ impl NightbaronApp {
             encrypt_pass_buffer: String::new(),
             decrypt_pass_buffer: String::new(),
             custom_salt_buffer: String::new(),
+            compression_level: 1,
+            smart_compression: true,
+            difficulty: Argon2Difficulty::Medium,
+            enable_split: false,
+            split_size_mb: 100,
+            block_size_mb: 64,
         }
     }
 
@@ -303,9 +203,6 @@ impl NightbaronApp {
                 }
                 AppMessage::Log(msg) => {
                     self.add_log(msg);
-                }
-                AppMessage::SuspendDetected => {
-                    self.zeroize_sensitive_data();
                 }
             }
         }
@@ -374,6 +271,11 @@ impl eframe::App for NightbaronApp {
                             let options = crypto::EncryptionOptions {
                                 custom_salt: if self.custom_salt.is_empty() { None } else { Some(self.custom_salt.as_str().to_string()) },
                                 delete_original: self.delete_original,
+                                difficulty: self.difficulty,
+                                compression_level: self.compression_level,
+                                smart_compression: self.smart_compression,
+                                split_size: if self.enable_split { Some(self.split_size_mb as usize * 1024 * 1024) } else { None },
+                                block_size: self.block_size_mb as usize * 1024 * 1024,
                             };
                             
                             self.status_message = "Starting encryption...".to_owned();
@@ -421,8 +323,6 @@ impl eframe::App for NightbaronApp {
                         }
                         if self.decrypt_path.is_empty() || self.decrypt_pass.is_empty() {
                             self.status_message = "Please fill in all fields".to_owned();
-                        } else if !self.decrypt_path.ends_with(".nightbaron") {
-                            self.status_message = "Please select a .nightbaron file".to_owned();
                         } else {
                             let path = self.decrypt_path.clone();
                             let mut pass_buffer = self.decrypt_pass.as_str();
@@ -449,16 +349,56 @@ impl eframe::App for NightbaronApp {
                     }
                 }
                 Tab::Settings => {
-                    ui.heading("Encryption Settings");
-                    ui.add_space(10.0);
-                    
-                    ui.label("Custom Salt (Optional):");
-                    ui.add(egui::TextEdit::singleline(&mut self.custom_salt_buffer));
-                    ui.label(egui::RichText::new("Leave empty to use a random salt (Recommended)").small().weak());
-                    
-                    ui.add_space(10.0);
-                    ui.checkbox(&mut self.delete_original, "Delete original folder after successful encryption");
-                    ui.label(egui::RichText::new("Warning: This will permanently delete the original files!").small().color(egui::Color32::RED));
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.heading("Encryption Settings");
+                        ui.add_space(10.0);
+                        
+                        ui.group(|ui| {
+                            ui.label("Encryption Difficulty (Memory Usage)");
+                            ui.radio_value(&mut self.difficulty, Argon2Difficulty::Light, "Light (64 MB) - Easy");
+                            ui.radio_value(&mut self.difficulty, Argon2Difficulty::Low, "Low (1 GB)");
+                            ui.radio_value(&mut self.difficulty, Argon2Difficulty::Medium, "Medium (2 GB) - Default");
+                            ui.radio_value(&mut self.difficulty, Argon2Difficulty::Hard, "Hard (4 GB)");
+                            ui.radio_value(&mut self.difficulty, Argon2Difficulty::Paranoid, "Paranoid (8 GB) - Maximum security");
+                        });
+                        ui.add_space(10.0);
+
+                        ui.group(|ui| {
+                            ui.label("Compression");
+                            ui.checkbox(&mut self.smart_compression, "Smart Compression");
+                            ui.add(egui::Slider::new(&mut self.compression_level, 0..=9).text("Compression Level"));
+                        });
+                        ui.add_space(10.0);
+
+                        ui.group(|ui| {
+                            ui.label("Archive Splitting & Block Size");
+                            ui.horizontal(|ui| {
+                                ui.label("Block Size (MB):");
+                                ui.add(egui::DragValue::new(&mut self.block_size_mb).range(1..=1024));
+                            });
+                            
+                            ui.checkbox(&mut self.enable_split, "Split Archive");
+                            if self.enable_split {
+                                ui.horizontal(|ui| {
+                                    ui.label("Volume Size (MB):");
+                                    ui.add(egui::DragValue::new(&mut self.split_size_mb).range(1..=10000));
+                                });
+                                if self.split_size_mb < self.block_size_mb {
+                                    ui.label(egui::RichText::new("Note: Volumes has to atleast be their block sizes.").color(egui::Color32::YELLOW));
+                                }
+                            }
+                        });
+                        ui.add_space(10.0);
+
+                        ui.separator();
+                        ui.label("General");
+                        ui.label("Custom Salt (Optional):");
+                        ui.add(egui::TextEdit::singleline(&mut self.custom_salt_buffer));
+                        
+                        ui.add_space(5.0);
+                        ui.checkbox(&mut self.delete_original, "Delete original folder after successful encryption");
+                        ui.label(egui::RichText::new("Warning: This will permanently delete the original files!").small().color(egui::Color32::RED));
+                    });
                 }
                 Tab::Logs => {
                     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -481,65 +421,10 @@ impl eframe::App for NightbaronApp {
     }
 }
 
-fn disable_core_dumps() {
-    #[cfg(unix)]
-    unsafe {
-        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-    }
-    #[cfg(windows)]
-    unsafe {
-        SetErrorMode(SEM_FAILCRITICALERRORS);
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn setup_linux_suspend_hook(sender: Sender<AppMessage>) {
-    thread::spawn(move || {
-        let conn = Connection::new_system().expect("Failed to connect to system bus");
-        conn.add_match("type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'").expect("Failed to add match");
-        for msg in conn.incoming(1000) {
-            if let Some(prepare) = msg.get1::<bool>() {
-                if prepare {
-                    sender.send(AppMessage::SuspendDetected).ok();
-                    println!("Linux suspend detected zeroizing sensitive data");
-                }
-            }
-        }
-    });
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn suspend_resume_callback(_context: *mut c_void, suspend_type: u32, _: *mut c_void) -> u32 {
-    if suspend_type == 4 {
-        if let Ok(sender_guard) = WINDOWS_SUSPEND_SENDER.lock() {
-            if let Some(ref sender) = *sender_guard {
-                sender.send(AppMessage::SuspendDetected).ok();
-                println!("Windows suspend detected zeroizing sensitive data");
-            }
-        }
-    }
-    0
-}
-
-#[cfg(windows)]
-fn setup_windows_suspend_hook(app: &mut NightbaronApp) {
-    if let Ok(mut sender_guard) = WINDOWS_SUSPEND_SENDER.lock() {
-        *sender_guard = Some(app.sender.clone());
-    }
-    
-    unsafe {
-        let mut handle: HANDLE = std::mem::zeroed();
-        let callback = suspend_resume_callback as isize;
-        PowerRegisterSuspendResumeNotification(0, callback, &mut handle as *mut _ as *mut *mut c_void);
-    }
-}
-
 fn main() -> eframe::Result<()> {
-    disable_core_dumps();
-
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([580.0, 450.0])
+            .with_inner_size([600.0, 500.0])
             .with_min_inner_size([400.0, 300.0]),
         ..Default::default()
     };
@@ -548,15 +433,7 @@ fn main() -> eframe::Result<()> {
         "Nightbaron Encryption",
         options,
         Box::new(|cc| {
-            let mut app = NightbaronApp::new(cc);
-
-            #[cfg(target_os = "linux")]
-            setup_linux_suspend_hook(app.sender.clone());
-
-            #[cfg(windows)]
-            setup_windows_suspend_hook(&mut app);
-
-            Ok(Box::new(app))
+            Ok(Box::new(NightbaronApp::new(cc)))
         }),
     )
 }

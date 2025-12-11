@@ -1,6 +1,6 @@
 [package]
 name = "Nightbaron"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 
 [dependencies]
@@ -12,12 +12,6 @@ tar = "0.4"
 eframe = "0.29"
 rfd = "0.15"
 zeroize = { version = "1.7", features = ["derive"] }
-memsec = "0.6"
 subtle = "2.5"
-libc = "0.2"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52.0", features = ["Win32_System_Memory", "Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Power", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_UI_WindowsAndMessaging"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-dbus = "0.9"
+xz2 = { version = "0.1.7", features = ["tokio"] }
+walkdir = "2.5.0"
